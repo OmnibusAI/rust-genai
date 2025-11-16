@@ -1,5 +1,5 @@
 //! OpenAI Embeddings API implementation
-//! API Documentation: https://platform.openai.com/docs/api-reference/embeddings
+//! API Documentation: <https://platform.openai.com/docs/api-reference/embeddings>
 
 use crate::adapter::adapters::support::get_api_key;
 use crate::adapter::{Adapter, ServiceType, WebRequestData};
@@ -103,7 +103,7 @@ pub fn to_embed_request_data(
 		&model,
 		ServiceType::Embed,
 		service_target.endpoint,
-	);
+	)?;
 
 	Ok(WebRequestData { url, headers, payload })
 }

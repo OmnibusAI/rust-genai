@@ -55,14 +55,15 @@ impl Adapter for GeminiAdapter {
 
 	/// NOTE: As Google Gemini has decided to put their API_KEY in the URL,
 	///       this will return the URL without the API_KEY in it. The API_KEY will need to be added by the caller.
-	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> String {
+	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> Result<String> {
 		let base_url = endpoint.base_url();
 		let (model_name, _) = model.model_name.as_model_name_and_namespace();
-		match service_type {
+		let url = match service_type {
 			ServiceType::Chat => format!("{base_url}models/{model_name}:generateContent"),
 			ServiceType::ChatStream => format!("{base_url}models/{model_name}:streamGenerateContent"),
 			ServiceType::Embed => format!("{base_url}models/{model_name}:embedContent"), // Gemini embeddings API
-		}
+		};
+		Ok(url)
 	}
 
 	fn to_web_request_data(
@@ -81,16 +82,16 @@ impl Adapter for GeminiAdapter {
 		let headers = Headers::from(("x-goog-api-key".to_string(), api_key.to_string()));
 
 		// -- Reasoning Budget
-		let (provider_model_name, reasoning_effort) = match (model_name, options_set.reasoning_effort()) {
+		let (provider_model_name, reasoning_budget) = match (model_name, options_set.reasoning_effort()) {
 			// No explicity reasoning_effor, try to infer from model name suffix (supports -zero)
 			(model, None) => {
 				// let model_name: &str = &model.model_name;
 				if let Some((prefix, last)) = model_name.rsplit_once('-') {
 					let reasoning = match last {
-						"zero" => Some(ReasoningEffort::Budget(REASONING_ZERO)),
-						"low" => Some(ReasoningEffort::Budget(REASONING_LOW)),
-						"medium" => Some(ReasoningEffort::Budget(REASONING_MEDIUM)),
-						"high" => Some(ReasoningEffort::Budget(REASONING_HIGH)),
+						"zero" => Some(REASONING_ZERO),
+						"low" => Some(REASONING_LOW),
+						"medium" => Some(REASONING_MEDIUM),
+						"high" => Some(REASONING_HIGH),
 						_ => None,
 					};
 					// create the model name if there was a `-..` reasoning suffix
@@ -105,11 +106,11 @@ impl Adapter for GeminiAdapter {
 			(model, Some(effort)) => {
 				let effort = match effort {
 					// -- for now, match minimal to Low (because zero is not supported by 2.5 pro)
-					ReasoningEffort::Minimal => ReasoningEffort::Budget(REASONING_LOW),
-					ReasoningEffort::Low => ReasoningEffort::Budget(REASONING_LOW),
-					ReasoningEffort::Medium => ReasoningEffort::Budget(REASONING_MEDIUM),
-					ReasoningEffort::High => ReasoningEffort::Budget(REASONING_HIGH),
-					ReasoningEffort::Budget(budget) => ReasoningEffort::Budget(*budget),
+					ReasoningEffort::Minimal => REASONING_LOW,
+					ReasoningEffort::Low => REASONING_LOW,
+					ReasoningEffort::Medium => REASONING_MEDIUM,
+					ReasoningEffort::High => REASONING_HIGH,
+					ReasoningEffort::Budget(budget) => *budget,
 				};
 				(model, Some(effort))
 			}
@@ -128,7 +129,7 @@ impl Adapter for GeminiAdapter {
 		});
 
 		// -- Set the reasoning effort
-		if let Some(ReasoningEffort::Budget(budget)) = reasoning_effort {
+		if let Some(budget) = reasoning_budget {
 			payload.x_insert("/generationConfig/thinkingConfig/thinkingBudget", budget)?;
 		}
 
@@ -183,8 +184,7 @@ impl Adapter for GeminiAdapter {
 
 		// -- url
 		let provider_model = model.from_name(provider_model_name);
-		let url = Self::get_service_url(&provider_model, service_type, endpoint);
-		let url = url.to_string();
+		let url = Self::get_service_url(&provider_model, service_type, endpoint)?;
 
 		Ok(WebRequestData { url, headers, payload })
 	}
@@ -209,17 +209,12 @@ impl Adapter for GeminiAdapter {
 		} = gemini_response;
 
 		// FIXME: Needs to take the content list
-		let mut tool_calls: Vec<ToolCall> = Default::default();
-		let mut content: Vec<MessageContent> = Default::default();
-		// let mut text_content:
+		let mut content: MessageContent = MessageContent::default();
 		for g_item in gemini_content {
 			match g_item {
-				GeminiChatContent::Text(text) => content.push(MessageContent::from_text(text)),
-				GeminiChatContent::ToolCall(tool_call) => tool_calls.push(tool_call),
+				GeminiChatContent::Text(text) => content.push(text),
+				GeminiChatContent::ToolCall(tool_call) => content.push(tool_call),
 			}
-		}
-		if !tool_calls.is_empty() {
-			content.push(MessageContent::from_tool_calls(tool_calls))
 		}
 
 		Ok(ChatResponse {
@@ -272,7 +267,7 @@ impl GeminiAdapter {
 	pub(super) fn body_to_gemini_chat_response(model_iden: &ModelIden, mut body: Value) -> Result<GeminiChatResponse> {
 		// If the body has an `error` property, then it is assumed to be an error.
 		if body.get("error").is_some() {
-			return Err(Error::StreamEventError {
+			return Err(Error::ChatResponse {
 				model_iden: model_iden.clone(),
 				body,
 			});
@@ -281,7 +276,22 @@ impl GeminiAdapter {
 		let mut content: Vec<GeminiChatContent> = Vec::new();
 
 		// -- Read multipart
-		let parts = body.x_take::<Vec<Value>>("/candidates/0/content/parts")?;
+		let parts = match body.x_take::<Vec<Value>>("/candidates/0/content/parts") {
+			Ok(parts) => parts,
+			Err(_) => {
+				let finish_reason = body.x_remove::<String>("/candidates/finishReason").ok();
+				let usage_metadata = body.x_remove::<Value>("/usageMetadata").ok();
+				let body = json!({
+					"finishReason": finish_reason,
+					"usageMetadata": usage_metadata,
+				});
+				return Err(Error::ChatResponse {
+					model_iden: model_iden.clone(),
+					body,
+				});
+			}
+		};
+
 		for mut part in parts {
 			// -- Capture eventual function call
 			if let Ok(fn_call_value) = part.x_take::<Value>("functionCall") {

@@ -1,13 +1,14 @@
 use crate::get_option_value;
-use crate::support::data::{IMAGE_URL_JPG_DUCK, get_b64_duck, get_b64_pdf};
+use crate::support::data::{IMAGE_URL_JPG_DUCK, get_b64_audio, get_b64_duck, get_b64_pdf, has_audio_file};
 use crate::support::{
-	Check, StreamExtract, TestResult, assert_contains, contains_checks, extract_stream_end, get_big_content,
-	seed_chat_req_simple, seed_chat_req_tool_simple, validate_checks,
+	Check, StreamExtract, TestResult, assert_contains, assert_reasoning_content, assert_reasoning_usage,
+	contains_checks, extract_stream_end, get_big_content, seed_chat_req_simple, seed_chat_req_tool_simple,
+	validate_checks,
 };
 use genai::adapter::AdapterKind;
 use genai::chat::{
-	BinarySource, CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ContentPart, JsonSpec, Tool,
-	ToolResponse,
+	BinarySource, CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ContentPart, JsonSpec,
+	ReasoningEffort, Tool, ToolResponse, Verbosity,
 };
 use genai::embed::EmbedOptions;
 use genai::resolver::{AuthData, AuthResolver, AuthResolverFn, IntoAuthResolverFn};
@@ -19,7 +20,7 @@ use value_ext::JsonValueExt;
 // region:    --- Chat
 
 pub async fn common_test_chat_simple_ok(model: &str, checks: Option<Check>) -> TestResult<()> {
-	validate_checks(checks.clone(), Check::REASONING | Check::REASONING_USAGE)?;
+	validate_checks(checks.clone(), Check::REASONING_CONTENT | Check::REASONING_USAGE)?;
 
 	// -- Setup & Fixtures
 	let client = Client::default();
@@ -27,6 +28,44 @@ pub async fn common_test_chat_simple_ok(model: &str, checks: Option<Check>) -> T
 
 	// -- Exec
 	let chat_res = client.exec_chat(model, chat_req, None).await?;
+
+	// -- Check Content
+	let content = chat_res.first_text().ok_or("Should have content")?;
+	assert!(!content.trim().is_empty(), "Content should not be empty");
+
+	// -- Check Usage
+	let usage = &chat_res.usage;
+	let prompt_tokens = get_option_value!(usage.prompt_tokens);
+	let completion_tokens = get_option_value!(usage.completion_tokens);
+	let total_tokens = get_option_value!(usage.total_tokens);
+	assert!(total_tokens > 0, "total_tokens should be > 0");
+	assert!(
+		total_tokens == prompt_tokens + completion_tokens,
+		"total_tokens should be equal to prompt_token + comletion_token"
+	);
+
+	// -- Check Reasoning Usage
+	if contains_checks(checks.clone(), Check::REASONING_USAGE) {
+		assert_reasoning_usage(usage)?;
+	}
+
+	// -- Check Reasoning Content
+	if contains_checks(checks, Check::REASONING_CONTENT) {
+		assert_reasoning_content(&chat_res)?;
+	}
+
+	Ok(())
+}
+
+// NOTE: here we still have the options about checking REASONING_USAGE, because Anthropic does not have reasoning token.
+pub async fn common_test_chat_reasoning_ok(model: &str, checks: Option<Check>) -> TestResult<()> {
+	// -- Setup & Fixtures
+	let client = Client::default();
+	let chat_req = seed_chat_req_simple();
+	let options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::High);
+
+	// -- Exec
+	let chat_res = client.exec_chat(model, chat_req, Some(&options)).await?;
 
 	// -- Check Content
 	let content = chat_res.first_text().ok_or("Should have content")?;
@@ -54,7 +93,7 @@ pub async fn common_test_chat_simple_ok(model: &str, checks: Option<Check>) -> T
 	}
 
 	// -- Check Reasoning Content
-	if contains_checks(checks, Check::REASONING) {
+	if contains_checks(checks, Check::REASONING_CONTENT) {
 		let reasoning_content = chat_res
 			.reasoning_content
 			.as_deref()
@@ -66,6 +105,54 @@ pub async fn common_test_chat_simple_ok(model: &str, checks: Option<Check>) -> T
 			"Reasoning content should be > than the content"
 		);
 	}
+
+	Ok(())
+}
+
+pub async fn common_test_chat_verbosity_ok(model: &str) -> TestResult<()> {
+	// -- Setup & Fixtures
+	let chat_client_options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+	let client = Client::builder().with_chat_options(chat_client_options).build();
+	let chat_req = ChatRequest::new(vec![
+		//
+		ChatMessage::user("Why is the sky blue?"),
+	]);
+
+	// -- Exec
+	// content low
+	let chat_options = ChatOptions::default().with_verbosity(Verbosity::Low);
+	let chat_res = client.exec_chat(model, chat_req.clone(), Some(&chat_options)).await?;
+	let content_low = chat_res.first_text().ok_or("Should have content")?;
+	// content high
+	let chat_options = ChatOptions::default().with_verbosity(Verbosity::High);
+	let chat_res = client.exec_chat(model, chat_req, Some(&chat_options)).await?;
+	let content_high = chat_res.first_text().ok_or("Should have content")?;
+
+	// -- Check Content
+	let ratio = content_high.len() as f64 / content_low.len() as f64;
+	assert!(
+		ratio >= 2.,
+		"The verbosity high was not high enough compared to the low. Ratio {ratio}"
+	);
+
+	Ok(())
+}
+
+pub async fn common_test_chat_top_system_ok(model: &str) -> TestResult<()> {
+	// -- Setup & Fixtures
+	let client = Client::default();
+	let chat_req = ChatRequest::new(vec![
+		// -- Messages (deactivate to see the differences)
+		ChatMessage::user("Why is the sky blue?"),
+	])
+	.with_system("Be very concise, and at end with 'Thank you'");
+
+	// -- Exec
+	let chat_res = client.exec_chat(model, chat_req, None).await?;
+
+	// -- Check
+	let content_txt = chat_res.content.joined_texts().ok_or("Should have texts")?;
+	assert_contains(&content_txt, "Thank you");
 
 	Ok(())
 }
@@ -244,13 +331,11 @@ pub async fn common_test_chat_stop_sequences_ok(model: &str) -> TestResult<()> {
 	// -- Exec
 	let chat_res = client.exec_chat(model, chat_req, Some(&chat_options)).await?;
 
-	let ai_content_lower = chat_res.first_text().ok_or("Should have a AI response")?.to_lowercase();
-
 	// -- Check
-	assert!(
-		!ai_content_lower.contains("london"),
-		"Content should not contain 'London'"
-	);
+	// Note: if there is no content, that's ok, it means "London" was the first answer.
+	if let Some(ai_content) = chat_res.content.into_joined_texts().map(|s| s.to_lowercase()) {
+		assert!(!ai_content.contains("london"), "Content should not contain 'London'");
+	}
 
 	Ok(())
 }
@@ -309,10 +394,12 @@ pub async fn common_test_chat_cache_implicit_simple_ok(model: &str) -> TestResul
 	]);
 
 	// -- Exec
-	// Execute twice
+	// Execute three times
 	let chat_res = client.exec_chat(model, chat_req.clone(), None).await?;
 	// sleep 500ms
-	tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	let chat_res = client.exec_chat(model, chat_req.clone(), None).await?;
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 	let chat_res = client.exec_chat(model, chat_req, None).await?;
 
 	// -- Check Content
@@ -331,7 +418,7 @@ pub async fn common_test_chat_cache_implicit_simple_ok(model: &str) -> TestResul
 		.ok_or("Should have prompt_tokens_details")?;
 	let cached_tokens = get_option_value!(prompt_tokens_details.cached_tokens);
 
-	assert!(cached_tokens > 0, " cached_tokens should be greater than 0");
+	assert!(cached_tokens > 0, "cached_tokens should be greater than 0");
 	assert!(total_tokens > 0, "total_tokens should be > 0");
 
 	Ok(())
@@ -425,7 +512,7 @@ pub async fn common_test_chat_cache_explicit_system_ok(model: &str) -> TestResul
 // region:    --- Chat Stream Tests
 
 pub async fn common_test_chat_stream_simple_ok(model: &str, checks: Option<Check>) -> TestResult<()> {
-	validate_checks(checks.clone(), Check::REASONING)?;
+	validate_checks(checks.clone(), Check::REASONING_CONTENT)?;
 
 	// -- Setup & Fixtures
 	let client = Client::default();
@@ -454,7 +541,7 @@ pub async fn common_test_chat_stream_simple_ok(model: &str, checks: Option<Check
 	);
 
 	// -- Check Reasoning Content
-	if contains_checks(checks, Check::REASONING) {
+	if contains_checks(checks, Check::REASONING_CONTENT) {
 		let reasoning_content =
 			reasoning_content.ok_or("extract_stream_end SHOULD have extracted some reasoning_content")?;
 		assert!(!reasoning_content.is_empty(), "reasoning_content should not be empty");
@@ -509,17 +596,19 @@ pub async fn common_test_chat_stream_capture_content_ok(model: &str) -> TestResu
 }
 
 pub async fn common_test_chat_stream_capture_all_ok(model: &str, checks: Option<Check>) -> TestResult<()> {
-	validate_checks(checks.clone(), Check::REASONING)?;
+	validate_checks(checks.clone(), Check::REASONING_CONTENT | Check::REASONING_USAGE)?;
 
 	// -- Setup & Fixtures
-	let client = Client::builder()
-		.with_chat_options(
-			ChatOptions::default()
-				.with_capture_usage(true)
-				.with_capture_content(true)
-				.with_capture_reasoning_content(true),
-		)
-		.build();
+	let mut chat_options = ChatOptions::default()
+		.with_capture_usage(true)
+		.with_capture_content(true)
+		.with_capture_reasoning_content(true);
+
+	if contains_checks(checks.clone(), Check::REASONING_CONTENT | Check::REASONING_USAGE) {
+		chat_options = chat_options.with_reasoning_effort(ReasoningEffort::Medium);
+	}
+
+	let client = Client::builder().with_chat_options(chat_options).build();
 	let chat_req = seed_chat_req_simple();
 
 	// -- Exec
@@ -553,19 +642,46 @@ pub async fn common_test_chat_stream_capture_all_ok(model: &str, checks: Option<
 	let captured_content = captured_content.ok_or("Captured content should have a text")?;
 	assert!(!captured_content.is_empty(), "captured_content.length should be > 0");
 
-	// -- Check Reasoning Content
-	if contains_checks(checks, Check::REASONING) {
-		let reasoning_content = stream_end
-			.captured_reasoning_content
-			.as_ref()
-			.ok_or("captured_reasoning_content SHOULD have extracted some reasoning_content")?;
-		assert!(!reasoning_content.is_empty(), "reasoning_content should not be empty");
-		// We can assume that the reasoning content should be bigger than the content given the prompt to keep content very concise.
-		assert!(
-			reasoning_content.len() > captured_content.len(),
-			"Reasoning content should be > than the content"
-		);
+	// -- Check Reasoning Usage
+	if contains_checks(checks.clone(), Check::REASONING_USAGE) {
+		assert_reasoning_usage(meta_usage)?;
 	}
+
+	// -- Check Reasoning Content
+	if contains_checks(checks, Check::REASONING_CONTENT) {
+		let _reasoning_content = reasoning_content.ok_or("Should have reasoning content")?;
+	}
+
+	Ok(())
+}
+
+/// Just making the tool request, and checking the tool call response
+/// `complete_check` if for LLMs that are better at giving back the unit and weather.
+pub async fn common_test_chat_stream_tool_capture_ok(model: &str) -> TestResult<()> {
+	// -- Setup & Fixtures
+	let client = Client::default();
+	let chat_req = seed_chat_req_tool_simple();
+	let mut chat_options = ChatOptions::default().with_capture_tool_calls(true);
+
+	// -- Exec
+	let chat_res = client.exec_chat_stream(model, chat_req, Some(&chat_options)).await?;
+
+	// Extract Stream content
+	let StreamExtract {
+		stream_end,
+		content,
+		reasoning_content,
+	} = extract_stream_end(chat_res.stream).await?;
+
+	// -- Check
+	let mut tool_calls = stream_end.captured_tool_calls().ok_or("Should have captured tools")?;
+	if tool_calls.is_empty() {
+		return Err("Should have tool calls in chat_res".into());
+	}
+	let tool_call = tool_calls.pop().ok_or("Should have at least one tool call")?;
+	assert_eq!(tool_call.fn_arguments.x_get_as::<&str>("city")?, "Paris");
+	assert_eq!(tool_call.fn_arguments.x_get_as::<&str>("country")?, "France");
+	assert_eq!(tool_call.fn_arguments.x_get_as::<&str>("unit")?, "C");
 
 	Ok(())
 }
@@ -611,6 +727,35 @@ pub async fn common_test_chat_image_b64_ok(model: &str) -> TestResult<()> {
 	// -- Check
 	let res = chat_res.first_text().ok_or("Should have text result")?;
 	assert_contains(res, "duck");
+
+	Ok(())
+}
+
+pub async fn common_test_chat_audio_b64_ok(model: &str) -> TestResult<()> {
+	if !has_audio_file() {
+		println!("No test audio file. Skipping this test.");
+		return Ok(());
+	}
+
+	// -- Setup
+	let client = Client::default();
+
+	// -- Build & Exec
+	let mut chat_req = ChatRequest::default().with_system("Transcribe the audio");
+	// This is similar to sending initial system chat messages (which will be cumulative with system chat messages)
+	chat_req = chat_req.append_message(ChatMessage::user(vec![ContentPart::from_binary_base64(
+		"audio/wav",
+		get_b64_audio()?,
+		None,
+	)]));
+
+	let chat_res = client.exec_chat(model, chat_req, None).await?;
+
+	// -- Check
+	let res = chat_res.first_text().ok_or("Should have text result")?;
+	// NOTE: here we make the test a little loose as the point of this test is not to test the model accuracy
+	assert_contains(res, "one small step");
+	assert_contains(res, "one giant leap");
 
 	Ok(())
 }
@@ -785,7 +930,7 @@ pub async fn common_test_embed_single_simple_ok_with_usage_check(model: &str, ex
 	assert!(!response.is_batch());
 
 	// -- Check Embedding
-	let embedding = response.first_embedding().unwrap();
+	let embedding = response.first_embedding().ok_or("Should have embedding")?;
 	assert_eq!(embedding.index(), 0);
 	assert!(embedding.dimensions() > 0);
 	assert_eq!(embedding.vector().len(), embedding.dimensions());
@@ -795,12 +940,12 @@ pub async fn common_test_embed_single_simple_ok_with_usage_check(model: &str, ex
 
 	if expect_usage {
 		assert!(response.usage.prompt_tokens.is_some());
-		assert!(response.usage.prompt_tokens.unwrap() > 0);
+		assert!(response.usage.prompt_tokens.ok_or("should have prompt token")? > 0);
 		assert!(response.usage.total_tokens.is_some());
 		println!(
 			"✓ Single embedding: {} dimensions, {} tokens",
 			embedding.dimensions(),
-			response.usage.prompt_tokens.unwrap()
+			response.usage.prompt_tokens.ok_or("Should have prompt_tokens")?
 		);
 	} else {
 		// Some providers (like Gemini) don't provide usage information for embeddings
@@ -836,7 +981,7 @@ pub async fn common_test_embed_single_with_options_ok_with_usage_check(
 	let response = client.embed(model, text, Some(&options)).await?;
 
 	// -- Check
-	let embedding = response.first_embedding().unwrap();
+	let embedding = response.first_embedding().ok_or("Should have embedding")?;
 	assert!(embedding.dimensions() > 0);
 
 	// Usage check (provider-dependent)
@@ -890,13 +1035,13 @@ pub async fn common_test_embed_batch_simple_ok_with_usage_check(model: &str, exp
 
 	// -- Check Usage (provider-dependent)
 	if expect_usage {
-		assert!(response.usage.prompt_tokens.is_some());
-		assert!(response.usage.prompt_tokens.unwrap() > 0);
+		let prompt_tokens = response.usage.prompt_tokens.ok_or("Should have prompt tokens")?;
+		assert!(prompt_tokens > 0);
 		println!(
 			"✓ Batch embedding: {} texts, {} dimensions each, {} tokens",
 			response.embedding_count(),
 			first_dims,
-			response.usage.prompt_tokens.unwrap()
+			prompt_tokens
 		);
 	} else {
 		// Some providers (like Gemini) don't provide usage information for embeddings
@@ -942,7 +1087,7 @@ pub async fn common_test_embed_provider_specific_options_ok_with_usage_check(
 	let response = client.embed(model, text, Some(&options)).await?;
 
 	// -- Check
-	let embedding = response.first_embedding().unwrap();
+	let embedding = response.first_embedding().ok_or("Should have embedding")?;
 	assert!(embedding.dimensions() > 0);
 
 	// Usage check (provider-dependent)

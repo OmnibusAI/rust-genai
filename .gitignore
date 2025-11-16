@@ -6,10 +6,14 @@
 _*
 # '_' in src dir, ok.
 !**/src/**/_*
+!**/spec/**/_*
 
 *.lock
 *.lockb
 *.log
+
+# -- AIPack related
+ako-config.jsonc
 
 # -- Rust
 target/
@@ -19,6 +23,16 @@ target/
 # -- Safety net
 dist/
 out/
+
+# Doc Files
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+*.doc
+*.xls
+*.ppt
+*.page
 
 # Data Files
 *.db3
@@ -37,6 +51,11 @@ out/
 *.ogg
 *.avi
 
+# Audio
+*.mp3
+*.wav
+*.flac
+
 # Images
 *.icns
 *.ico
@@ -45,7 +64,9 @@ out/
 *.png
 *.bmp
 
-!tests/data/*.jpg
+# -- Test data (one by one)
+!tests/data/duck-small.jpg
+!tests/data/small.pdf
 
 # -- Nodejs
 node_modules/

@@ -24,9 +24,14 @@ pub struct OpenAIAdapter;
 // Latest models
 const MODELS: &[&str] = &[
 	//
+	"gpt-5.1",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-mini",
 	"gpt-5",
 	"gpt-5-mini",
 	"gpt-5-nano",
+	"gpt-audio-mini",
+	"gpt-audio",
 ];
 
 impl OpenAIAdapter {
@@ -48,7 +53,7 @@ impl Adapter for OpenAIAdapter {
 		Ok(MODELS.iter().map(|s| s.to_string()).collect())
 	}
 
-	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> String {
+	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> Result<String> {
 		Self::util_get_service_url(model, service_type, endpoint)
 	}
 
@@ -81,7 +86,7 @@ impl Adapter for OpenAIAdapter {
 			.unwrap_or_default();
 
 		// -- Capture the content
-		let mut content: Vec<MessageContent> = Vec::new();
+		let mut content: MessageContent = MessageContent::default();
 		let mut reasoning_content: Option<String> = None;
 
 		if let Ok(Some(mut first_choice)) = body.x_take::<Option<Value>>("/choices/0") {
@@ -113,7 +118,7 @@ impl Adapter for OpenAIAdapter {
 
 				// After extracting reasoning_content, sometimes the content is empty.
 				if !text_content.is_empty() {
-					content.push(text_content.into());
+					content.push(text_content);
 				}
 			}
 
@@ -125,7 +130,7 @@ impl Adapter for OpenAIAdapter {
 				.transpose()?
 				.map(MessageContent::from_tool_calls)
 			{
-				content.push(tool_calls);
+				content.extend(tool_calls);
 			}
 		}
 
@@ -178,19 +183,24 @@ impl OpenAIAdapter {
 		service_type: ServiceType,
 		// -- utility arguments
 		default_endpoint: Endpoint,
-	) -> String {
+	) -> Result<String> {
 		let base_url = default_endpoint.base_url();
 		// Parse into URL and query-params
-		let base_url = reqwest::Url::parse(base_url).unwrap();
+		let base_url = reqwest::Url::parse(base_url)
+			.map_err(|err| Error::Internal(format!("Cannot parse url: {base_url}. Cause:\n{err}")))?;
 		let original_query_params = base_url.query().to_owned();
 
 		let suffix = match service_type {
 			ServiceType::Chat | ServiceType::ChatStream => "chat/completions",
 			ServiceType::Embed => "embeddings",
 		};
-		let mut full_url = base_url.join(suffix).unwrap();
+		let mut full_url = base_url.join(suffix).map_err(|err| {
+			Error::Internal(format!(
+				"Cannot joing suffix '{suffix}' for url: {base_url}. Cause:\n{err}"
+			))
+		})?;
 		full_url.set_query(original_query_params);
-		full_url.to_string()
+		Ok(full_url.to_string())
 	}
 
 	/// Shared OpenAI to_web_request_data for various OpenAI compatible adapters
@@ -209,7 +219,7 @@ impl OpenAIAdapter {
 		let api_key = get_api_key(auth, &model)?;
 
 		// -- url
-		let url = AdapterDispatcher::get_service_url(&model, service_type, endpoint);
+		let url = AdapterDispatcher::get_service_url(&model, service_type, endpoint)?;
 
 		// -- headers
 		let mut headers = Headers::from(("Authorization".to_string(), format!("Bearer {api_key}")));
@@ -250,6 +260,13 @@ impl OpenAIAdapter {
 			&& let Some(keyword) = reasoning_effort.as_keyword()
 		{
 			payload.x_insert("reasoning_effort", keyword)?;
+		}
+
+		// -- Set verbosity
+		if let Some(verbosity) = options_set.verbosity()
+			&& let Some(keyword) = verbosity.as_keyword()
+		{
+			payload.x_insert("verbosity", keyword)?;
 		}
 
 		// -- Tools
@@ -320,6 +337,12 @@ impl OpenAIAdapter {
 		if let Some(seed) = options_set.seed() {
 			payload.x_insert("seed", seed)?;
 		}
+		if let Some(service_tier) = options_set.service_tier()
+			&& let Some(keyword) = service_tier.as_keyword()
+		{
+			payload.x_insert("service_tier", keyword)?;
+		}
+
 		Ok(WebRequestData { url, headers, payload })
 	}
 
@@ -327,7 +350,7 @@ impl OpenAIAdapter {
 	pub(super) fn into_usage(adapter: AdapterKind, usage_value: Value) -> Usage {
 		// NOTE: here we make sure we do not fail since we do not want to break a response because usage parsing fail
 		let usage = serde_json::from_value(usage_value).map_err(|err| {
-			error!("Fail to deserilaize uage. Cause: {err}");
+			error!("Fail to deserialize usage. Cause: {err}");
 			err
 		});
 		let mut usage: Usage = usage.unwrap_or_default();
@@ -386,12 +409,34 @@ impl OpenAIAdapter {
 							match part {
 								ContentPart::Text(content) => values.push(json!({"type": "text", "text": content})),
 								ContentPart::Binary(binary) => {
+									let is_audio = binary.is_audio();
 									let is_image = binary.is_image();
 									let Binary {
 										content_type, source, ..
 									} = binary;
 
-									if is_image {
+									if is_audio {
+										match &source {
+											BinarySource::Url(_url) => {
+												warn!(
+													"OpenAI doesn't support audio from URL, need to handle it gracefully"
+												);
+											}
+											BinarySource::Base64(content) => {
+												let mut format = content_type.split('/').next_back().unwrap_or("");
+												if format == "mpeg" {
+													format = "mp3";
+												}
+												values.push(json!({
+													"type": "input_audio",
+													"input_audio": {
+														"data": content,
+														"format": format
+													}
+												}));
+											}
+										}
+									} else if is_image {
 										match &source {
 											BinarySource::Url(url) => {
 												values.push(json!({"type": "image_url", "image_url": {"url": url}}))

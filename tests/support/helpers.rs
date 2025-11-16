@@ -33,7 +33,7 @@ bitflags::bitflags! {
 	#[derive(Clone)]
 	pub struct Check: u8 {
 		/// Check if the
-		const REASONING       = 0b00000001;
+		const REASONING_CONTENT       = 0b00000001;
 		const REASONING_USAGE = 0b00000010;
 		const USAGE           = 0b00000100;
 	}
@@ -43,7 +43,7 @@ bitflags::bitflags! {
 impl std::fmt::Debug for Check {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let mut buffer = String::new();
-		to_writer(self, &mut buffer).unwrap();
+		to_writer(self, &mut buffer)?;
 		write!(f, "{buffer}")
 	}
 }

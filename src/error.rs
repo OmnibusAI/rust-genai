@@ -30,8 +30,14 @@ pub enum Error {
 	#[display("JSON mode requested but no instruction/prompt provided.")]
 	JsonModeWithoutInstruction,
 
+	#[display("Failed to parse verbosity. Actual: '{actual}'")]
+	VerbosityParsing { actual: String },
+
 	#[display("Failed to parse reasoning. Actual: '{actual}'")]
 	ReasoningParsingError { actual: String },
+
+	#[display("Failed to parse service tier. Actual: '{actual}'")]
+	ServiceTierParsing { actual: String },
 
 	// -- Chat Output
 	#[display("No chat response from model '{model_iden}'")]
@@ -70,17 +76,17 @@ pub enum Error {
 		webc_error: webc::Error,
 	},
 
+	#[display("Error event in stream for model '{model_iden}'. Body: {body}")]
+	ChatResponse {
+		model_iden: ModelIden,
+		body: serde_json::Value,
+	},
+
 	// -- Chat Stream
 	#[display("Failed to parse stream data for model '{model_iden}'.\nCause: {serde_error}")]
 	StreamParse {
 		model_iden: ModelIden,
 		serde_error: serde_json::Error,
-	},
-
-	#[display("Error event in stream for model '{model_iden}'. Body: {body}")]
-	StreamEventError {
-		model_iden: ModelIden,
-		body: serde_json::Value,
 	},
 
 	#[display("Web stream error for model '{model_iden}'.\nCause: {cause}")]
@@ -96,6 +102,9 @@ pub enum Error {
 	// -- Adapter Support
 	#[display("Adapter '{adapter_kind}' does not support feature '{feature}'")]
 	AdapterNotSupported { adapter_kind: AdapterKind, feature: String },
+
+	#[display("Internal error: {_0}")]
+	Internal(String),
 
 	// -- Externals
 	#[display("Failed to clone EventSource request: {_0}")]

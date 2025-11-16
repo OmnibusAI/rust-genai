@@ -1,25 +1,28 @@
 //! This module contains all the types related to a Chat Request (except ChatOptions, which has its own file).
 
 use crate::chat::{ChatMessage, ChatRole, Tool};
+use crate::support;
 use serde::{Deserialize, Serialize};
 
 // region:    --- ChatRequest
 
-/// The Chat request when performing a direct `Client::`
+/// Chat request for client chat calls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
 	/// The initial system content of the request.
 	pub system: Option<String>,
 
 	/// The messages of the request.
+	#[serde(default)]
 	pub messages: Vec<ChatMessage>,
 
+	/// Optional tool definitions available to the model.
 	pub tools: Option<Vec<Tool>>,
 }
 
 /// Constructors
 impl ChatRequest {
-	/// Create a new ChatRequest with the given messages.
+	/// Construct from a set of messages.
 	pub fn new(messages: Vec<ChatMessage>) -> Self {
 		Self {
 			messages,
@@ -28,7 +31,7 @@ impl ChatRequest {
 		}
 	}
 
-	/// Create a ChatRequest from the `.system` property content.
+	/// Construct with an initial system prompt.
 	pub fn from_system(content: impl Into<String>) -> Self {
 		Self {
 			system: Some(content.into()),
@@ -37,7 +40,7 @@ impl ChatRequest {
 		}
 	}
 
-	/// Create a ChatRequest with one user message.
+	/// Construct with a single user message.
 	pub fn from_user(content: impl Into<String>) -> Self {
 		Self {
 			system: None,
@@ -46,7 +49,7 @@ impl ChatRequest {
 		}
 	}
 
-	/// Create a new request from messages.
+	/// Construct from messages.
 	pub fn from_messages(messages: Vec<ChatMessage>) -> Self {
 		Self {
 			system: None,
@@ -58,28 +61,39 @@ impl ChatRequest {
 
 /// Chainable Setters
 impl ChatRequest {
-	/// Set the system content of the request.
+	/// Set or replace the system prompt.
 	pub fn with_system(mut self, system: impl Into<String>) -> Self {
 		self.system = Some(system.into());
 		self
 	}
 
-	/// Append a message to the request.
+	/// Append one message.
 	pub fn append_message(mut self, msg: impl Into<ChatMessage>) -> Self {
 		self.messages.push(msg.into());
 		self
 	}
 
-	pub fn append_messages(mut self, messages: Vec<ChatMessage>) -> Self {
-		self.messages.extend(messages);
+	/// Append multiple messages from any iterable.
+	pub fn append_messages<I>(mut self, messages: I) -> Self
+	where
+		I: IntoIterator,
+		I::Item: Into<ChatMessage>,
+	{
+		self.messages.extend(messages.into_iter().map(Into::into));
 		self
 	}
 
-	pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
-		self.tools = Some(tools);
+	/// Replace the tool set.
+	pub fn with_tools<I>(mut self, tools: I) -> Self
+	where
+		I: IntoIterator,
+		I::Item: Into<Tool>,
+	{
+		self.tools = Some(tools.into_iter().map(Into::into).collect());
 		self
 	}
 
+	/// Append one tool.
 	pub fn append_tool(mut self, tool: impl Into<Tool>) -> Self {
 		self.tools.get_or_insert_with(Vec::new).push(tool.into());
 		self
@@ -88,8 +102,7 @@ impl ChatRequest {
 
 /// Getters
 impl ChatRequest {
-	/// Iterate through all of the system content, starting with the eventual
-	/// ChatRequest.system and then the ChatMessage of role System.
+	/// Iterate over all system content: the top-level system prompt, then any system-role messages.
 	pub fn iter_systems(&self) -> impl Iterator<Item = &str> {
 		self.system
 			.iter()
@@ -100,29 +113,23 @@ impl ChatRequest {
 			}))
 	}
 
-	/// Combine the eventual ChatRequest `.system` and system messages into one string.
-	/// - It will start with the eventual `chat_request.system`.
-	/// - Then concatenate the eventual `ChatRequestMessage` of Role `System`.
-	/// - This will attempt to add an empty line between system content. So, it will add
-	///   - Two `\n` when the previous content does not end with `\n`.
-	///   - One `\n` if the previous content ends with `\n`.
-	pub fn combine_systems(&self) -> Option<String> {
+	/// Concatenate all systems into one string,  
+	/// keeping one empty line in between
+	pub fn join_systems(&self) -> Option<String> {
 		let mut systems: Option<String> = None;
 
 		for system in self.iter_systems() {
-			let systems_content = systems.get_or_insert_with(|| "".to_string());
+			let systems_content = systems.get_or_insert_with(String::new);
 
-			// Add eventual separator
-			if systems_content.ends_with('\n') {
-				systems_content.push('\n');
-			} else if !systems_content.is_empty() {
-				systems_content.push_str("\n\n");
-			} // Do not add any empty line if previous content is empty
-
-			systems_content.push_str(system);
+			support::combine_text_with_empty_line(systems_content, system);
 		}
 
 		systems
+	}
+
+	#[deprecated(note = "use join_systems()")]
+	pub fn combine_systems(&self) -> Option<String> {
+		self.join_systems()
 	}
 }
 
