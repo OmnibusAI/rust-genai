@@ -418,7 +418,7 @@ impl AnthropicAdapter {
 
 				// User message: text, binary (image/document), and tool_result supported.
 				ChatRole::User => {
-					if msg.content.is_text_only() {
+					if msg.content.len() == 1 && msg.content.is_text_only() {
 						let text = msg.content.joined_texts().unwrap_or_else(String::new);
 						let content = apply_cache_control_to_text(is_cache_control, text);
 						messages.push(json!({"role": "user", "content": content}));
