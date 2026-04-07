@@ -62,6 +62,16 @@ async fn test_chat_claude_multi_system_ok() -> TestResult<()> {
 	common_tests::common_test_chat_multi_system_ok(MODEL_CLAUDE).await
 }
 
+// Vertex Claude does not currently support structured output (output_config.format).
+// See: https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+// This test is kept as a canary -- remove #[ignore] when Vertex adds support.
+#[tokio::test]
+#[serial(vertex)]
+#[ignore = "Vertex Claude does not support output_config.format (structured output)"]
+async fn test_chat_claude_json_structured_ok() -> TestResult<()> {
+	common_tests::common_test_chat_json_structured_ok(MODEL_CLAUDE, Some(Check::USAGE)).await
+}
+
 #[tokio::test]
 #[serial(vertex)]
 async fn test_chat_claude_temperature_ok() -> TestResult<()> {

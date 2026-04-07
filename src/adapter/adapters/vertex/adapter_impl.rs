@@ -1,5 +1,5 @@
 use crate::adapter::adapters::support::get_api_key;
-use crate::adapter::anthropic::{AnthropicAdapter, AnthropicRequestParts};
+use crate::adapter::anthropic::AnthropicAdapter;
 use crate::adapter::gemini::GeminiAdapter;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{ChatOptionsSet, ChatRequest, ChatResponse, ChatStreamResponse};
@@ -7,7 +7,6 @@ use crate::resolver::{AuthData, Endpoint};
 use crate::webc::WebResponse;
 use crate::{Error, Headers, ModelIden, Result, ServiceTarget};
 use reqwest::RequestBuilder;
-use serde_json::json;
 use tracing::warn;
 use value_ext::JsonValueExt;
 
@@ -242,47 +241,167 @@ impl VertexAdapter {
 		chat_req: ChatRequest,
 		options_set: ChatOptionsSet<'_, '_>,
 	) -> Result<WebRequestData> {
-		let AnthropicRequestParts {
-			system,
-			messages,
-			tools,
-		} = AnthropicAdapter::into_anthropic_request_parts(chat_req)?;
+		// Reuse the shared Anthropic payload builder (mirrors the Gemini pattern above).
+		// Vertex Claude: model is in URL, not body; anthropic_version goes in body instead of "model".
+		let (mut payload, resolved_model_name) =
+			AnthropicAdapter::build_anthropic_request_payload(model_name, service_type, chat_req, &options_set)?;
+		payload.x_insert("anthropic_version", VERTEX_ANTHROPIC_VERSION)?;
 
-		// Vertex Anthropic: model is in URL, not body; anthropic_version goes in body
-		let stream = matches!(service_type, ServiceType::ChatStream);
-		let mut payload = json!({
-			"anthropic_version": VERTEX_ANTHROPIC_VERSION,
-			"messages": messages,
-			"stream": stream,
-		});
-
-		if let Some(system) = system {
-			payload.x_insert("system", system)?;
+		// Vertex Claude does not support structured output via output_config.format
+		// (only the direct Anthropic API and Amazon Bedrock do).
+		// Strip format from output_config so the request isn't rejected, and warn the caller.
+		// See: https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+		if let Some(output_config) = payload.get_mut("output_config").and_then(|v| v.as_object_mut()) {
+			if output_config.remove("format").is_some() {
+				warn!(
+					"Vertex Claude does not support structured output (output_config.format). \
+					 The response_format option has been ignored for model '{model_name}'. \
+					 Use the direct Anthropic adapter or Amazon Bedrock for constrained JSON output."
+				);
+			}
+			// If output_config is now empty (no effort either), remove it entirely
+			if output_config.is_empty() {
+				payload.as_object_mut().map(|m| m.remove("output_config"));
+			}
 		}
 
-		if let Some(tools) = tools {
-			payload.x_insert("/tools", tools)?;
-		}
-
-		if let Some(temperature) = options_set.temperature() {
-			payload.x_insert("temperature", temperature)?;
-		}
-
-		if !options_set.stop_sequences().is_empty() {
-			payload.x_insert("stop_sequences", options_set.stop_sequences())?;
-		}
-
-		let max_tokens = AnthropicAdapter::resolve_max_tokens(model_name, &options_set);
-		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
-
-		if let Some(top_p) = options_set.top_p() {
-			payload.x_insert("top_p", top_p)?;
-		}
-
-		let url = Self::get_service_url(&model, service_type, endpoint)?;
+		// Use the resolved (suffix-stripped) model name for the URL, just like the Gemini path,
+		// so reasoning suffixes like "-high" don't leak into the Vertex AI endpoint URL.
+		let provider_model = model.from_name(&resolved_model_name);
+		let url = Self::get_service_url(&provider_model, service_type, endpoint)?;
 
 		Ok(WebRequestData { url, headers, payload })
 	}
 }
 
 // endregion: --- Anthropic Publisher Support
+
+// region:    --- Tests
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::adapter::ServiceType;
+	use crate::chat::{ChatOptions, ChatOptionsSet, ChatRequest, ChatResponseFormat, JsonSpec};
+	use serde_json::json;
+
+	/// Verifies that the Vertex Claude path includes anthropic_version, does NOT include
+	/// "model" (model is in the URL), and strips output_config.format since Vertex
+	/// Claude doesn't support structured output.
+	#[test]
+	fn test_vertex_claude_payload_has_anthropic_version_and_no_model() {
+		let options_set = ChatOptionsSet::default();
+
+		let model_iden = ModelIden::new(AdapterKind::Vertex, "claude-sonnet-4-6");
+		let endpoint = VertexAdapter::default_endpoint();
+
+		let web_req = VertexAdapter::to_anthropic_web_request_data(
+			model_iden,
+			"claude-sonnet-4-6",
+			endpoint,
+			Headers::default(),
+			ServiceType::Chat,
+			ChatRequest::from_user("hello"),
+			options_set,
+		)
+		.expect("to_anthropic_web_request_data should succeed");
+
+		let payload = &web_req.payload;
+
+		// anthropic_version must be present (Vertex Claude discriminator)
+		assert_eq!(
+			payload.get("anthropic_version").and_then(|v| v.as_str()),
+			Some(VERTEX_ANTHROPIC_VERSION),
+			"anthropic_version must be set to the Vertex version string"
+		);
+
+		// "model" must NOT be in the payload -- Vertex puts model in URL
+		assert!(payload.get("model").is_none(), "model must not be in Vertex Claude payload");
+	}
+
+	/// Verifies that output_config.format (structured output) is stripped from the
+	/// Vertex Claude payload because Vertex doesn't support it. If only format was
+	/// in output_config, the entire key should be removed.
+	#[test]
+	fn test_vertex_claude_strips_unsupported_output_config_format() {
+		let chat_options = ChatOptions {
+			response_format: Some(ChatResponseFormat::JsonSpec(JsonSpec::new(
+				"test_schema",
+				json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
+			))),
+			..Default::default()
+		};
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+
+		let model_iden = ModelIden::new(AdapterKind::Vertex, "claude-sonnet-4-6");
+		let endpoint = VertexAdapter::default_endpoint();
+
+		let web_req = VertexAdapter::to_anthropic_web_request_data(
+			model_iden,
+			"claude-sonnet-4-6",
+			endpoint,
+			Headers::default(),
+			ServiceType::Chat,
+			ChatRequest::from_user("hello"),
+			options_set,
+		)
+		.expect("to_anthropic_web_request_data should succeed");
+
+		let payload = &web_req.payload;
+
+		// output_config.format must be stripped (Vertex Claude doesn't support structured output)
+		assert!(
+			payload.get("output_config").is_none(),
+			"output_config should be removed entirely when only format was present"
+		);
+	}
+
+	/// Verifies that when both reasoning effort and structured output are set, the
+	/// Vertex path preserves output_config.effort but strips output_config.format.
+	#[test]
+	fn test_vertex_claude_keeps_effort_but_strips_format() {
+		use crate::chat::ReasoningEffort;
+
+		let chat_options = ChatOptions {
+			reasoning_effort: Some(ReasoningEffort::High),
+			response_format: Some(ChatResponseFormat::JsonSpec(JsonSpec::new(
+				"test_schema",
+				json!({"type": "object", "properties": {}}),
+			))),
+			..Default::default()
+		};
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+
+		let model_iden = ModelIden::new(AdapterKind::Vertex, "claude-sonnet-4-6");
+		let endpoint = VertexAdapter::default_endpoint();
+
+		let web_req = VertexAdapter::to_anthropic_web_request_data(
+			model_iden,
+			"claude-sonnet-4-6",
+			endpoint,
+			Headers::default(),
+			ServiceType::Chat,
+			ChatRequest::from_user("hello"),
+			options_set,
+		)
+		.expect("to_anthropic_web_request_data should succeed");
+
+		let payload = &web_req.payload;
+		let output_config = payload.get("output_config").expect("output_config must be present (effort remains)");
+
+		// effort should be preserved
+		assert_eq!(
+			output_config.get("effort").and_then(|v| v.as_str()),
+			Some("high"),
+			"effort must be preserved in output_config"
+		);
+
+		// format must be stripped
+		assert!(
+			output_config.get("format").is_none(),
+			"format must be stripped from output_config on Vertex Claude"
+		);
+	}
+}
+
+// endregion: --- Tests

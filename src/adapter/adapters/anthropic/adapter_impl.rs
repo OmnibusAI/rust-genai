@@ -222,108 +222,12 @@ impl Adapter for AnthropicAdapter {
 			("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
 		]);
 
-		// -- Parts
-		let AnthropicRequestParts {
-			system,
-			messages,
-			tools,
-		} = Self::into_anthropic_request_parts(chat_req)?;
-
-		// -- Extract Model Name and Reasoning
 		let (_, raw_model_name) = model.model_name.namespace_and_name();
 
-		// -- Reasoning Budget
-		let (model_name, computed_reasoning_effort) = match (raw_model_name, options_set.reasoning_effort()) {
-			// No explicity reasoning_effor, try to infer from model name suffix (supports -zero)
-			(model, None) => {
-				// let model_name: &str = &model.model_name;
-				if let Some((prefix, last)) = raw_model_name.rsplit_once('-') {
-					let reasoning = match last {
-						"zero" => None,
-						"None" => Some(ReasoningEffort::Low),
-						"minimal" => Some(ReasoningEffort::Low),
-						"low" => Some(ReasoningEffort::Low),
-						"medium" => Some(ReasoningEffort::Medium),
-						"high" => Some(ReasoningEffort::High),
-						"xhigh" => Some(ReasoningEffort::XHigh),
-						"max" => Some(ReasoningEffort::Max),
-						_ => None,
-					};
-					// create the model name if there was a `-..` reasoning suffix
-					let model = if reasoning.is_some() { prefix } else { model };
-
-					(model, reasoning)
-				} else {
-					(model, None)
-				}
-			}
-			// If reasoning effort, turn the low, medium, budget ones into Budget
-			(model, Some(effort)) => (model, Some(effort.clone())),
-		};
-
-		// -- Build the basic payload
-		let stream = matches!(service_type, ServiceType::ChatStream);
-		let mut payload = json!({
-			"model": model_name.to_string(),
-			"messages": messages,
-			"stream": stream
-		});
-
-		if let Some(system) = system {
-			payload.x_insert("system", system)?;
-		}
-
-		if let Some(tools) = tools {
-			payload.x_insert("/tools", tools)?;
-		}
-
-		// -- Set the reasoning effort
-		// Both reasoning effort and structured-output format write into `output_config`.
-		// Build a shared map so both contributions end up in the same object.
-		let mut output_config: Map<String, Value> = Map::new();
-
-		if let Some(computed_reasoning_effort) = computed_reasoning_effort {
-			insert_anthropic_reasoning(&mut payload, &mut output_config, model_name, &computed_reasoning_effort)?;
-		}
-
-		if let Some(cache_control) = options_set.cache_control() {
-			info!(
-				"Anthropic request-level cache_control '{cache_control:?}' is currently ignored. Use message-level cache_control instead."
-			);
-		}
-
-		// -- Add supported ChatOptions
-		if let Some(ChatResponseFormat::JsonSpec(st_json)) = options_set.response_format() {
-			// https://platform.claude.com/docs/en/build-with-claude/structured-outputs#json-outputs
-			// Note: Anthropic's json_schema format does not use a schema name; JsonSpec.name is intentionally omitted.
-			output_config.insert(
-				"format".to_string(),
-				json!({
-					"type": "json_schema",
-					"schema": st_json.schema_with_additional_properties_false(),
-				}),
-			);
-		}
-
-		// Insert output_config once, merging effort + format into a single object.
-		if !output_config.is_empty() {
-			payload.x_insert("output_config", Value::Object(output_config))?;
-		}
-
-		if let Some(temperature) = options_set.temperature() {
-			payload.x_insert("temperature", temperature)?;
-		}
-
-		if !options_set.stop_sequences().is_empty() {
-			payload.x_insert("stop_sequences", options_set.stop_sequences())?;
-		}
-
-		let max_tokens = Self::resolve_max_tokens(model_name, &options_set);
-		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
-
-		if let Some(top_p) = options_set.top_p() {
-			payload.x_insert("top_p", top_p)?;
-		}
+		// Build the shared payload (everything except "model"), then insert model.
+		let (mut payload, resolved_model_name) =
+			Self::build_anthropic_request_payload(raw_model_name, service_type, chat_req, &options_set)?;
+		payload.x_insert("model", resolved_model_name)?;
 
 		Ok(WebRequestData { url, headers, payload })
 	}
@@ -449,6 +353,125 @@ impl Adapter for AnthropicAdapter {
 // region:    --- Support
 
 impl AnthropicAdapter {
+	/// Builds the Anthropic JSON payload from a ChatRequest, including reasoning budget
+	/// resolution, system instruction, tools, output_config (effort + structured output),
+	/// and standard chat options (temperature, stop_sequences, max_tokens, top_p).
+	///
+	/// Returns `(payload, resolved_model_name)` where resolved_model_name has any
+	/// reasoning-effort suffix stripped. The payload does **not** contain `"model"` or
+	/// `"anthropic_version"` -- the caller is responsible for inserting whichever
+	/// discriminator its wire format requires:
+	///   - Direct Anthropic: `payload["model"] = resolved_model_name`
+	///   - Vertex Claude:    `payload["anthropic_version"] = VERTEX_ANTHROPIC_VERSION`
+	pub(in crate::adapter) fn build_anthropic_request_payload(
+		raw_model_name: &str,
+		service_type: ServiceType,
+		chat_req: ChatRequest,
+		options_set: &ChatOptionsSet<'_, '_>,
+	) -> Result<(Value, String)> {
+		// -- Parts
+		let AnthropicRequestParts {
+			system,
+			messages,
+			tools,
+		} = Self::into_anthropic_request_parts(chat_req)?;
+
+		// -- Reasoning Budget
+		// Try to infer reasoning effort from a model name suffix (e.g. "-high", "-zero")
+		// when no explicit reasoning_effort option was provided.
+		let (model_name, computed_reasoning_effort) = match (raw_model_name, options_set.reasoning_effort()) {
+			// No explicit reasoning_effort, try to infer from model name suffix (supports -zero)
+			(model, None) => {
+				if let Some((prefix, last)) = raw_model_name.rsplit_once('-') {
+					let reasoning = match last {
+						"zero" => None,
+						"None" => Some(ReasoningEffort::Low),
+						"minimal" => Some(ReasoningEffort::Low),
+						"low" => Some(ReasoningEffort::Low),
+						"medium" => Some(ReasoningEffort::Medium),
+						"high" => Some(ReasoningEffort::High),
+						"xhigh" => Some(ReasoningEffort::XHigh),
+						"max" => Some(ReasoningEffort::Max),
+						_ => None,
+					};
+					// create the model name if there was a `-..` reasoning suffix
+					let model = if reasoning.is_some() { prefix } else { model };
+
+					(model, reasoning)
+				} else {
+					(model, None)
+				}
+			}
+			// If reasoning effort, turn the low, medium, budget ones into Budget
+			(model, Some(effort)) => (model, Some(effort.clone())),
+		};
+
+		// -- Build the basic payload (no "model" -- caller inserts the right discriminator)
+		let stream = matches!(service_type, ServiceType::ChatStream);
+		let mut payload = json!({
+			"messages": messages,
+			"stream": stream
+		});
+
+		if let Some(system) = system {
+			payload.x_insert("system", system)?;
+		}
+
+		if let Some(tools) = tools {
+			payload.x_insert("/tools", tools)?;
+		}
+
+		// -- Set the reasoning effort
+		// Both reasoning effort and structured-output format write into `output_config`.
+		// Build a shared map so both contributions end up in the same object.
+		let mut output_config: Map<String, Value> = Map::new();
+
+		if let Some(computed_reasoning_effort) = computed_reasoning_effort {
+			insert_anthropic_reasoning(&mut payload, &mut output_config, model_name, &computed_reasoning_effort)?;
+		}
+
+		if let Some(cache_control) = options_set.cache_control() {
+			info!(
+				"Anthropic request-level cache_control '{cache_control:?}' is currently ignored. Use message-level cache_control instead."
+			);
+		}
+
+		// -- Add supported ChatOptions
+		if let Some(ChatResponseFormat::JsonSpec(st_json)) = options_set.response_format() {
+			// https://platform.claude.com/docs/en/build-with-claude/structured-outputs#json-outputs
+			// Note: Anthropic's json_schema format does not use a schema name; JsonSpec.name is intentionally omitted.
+			output_config.insert(
+				"format".to_string(),
+				json!({
+					"type": "json_schema",
+					"schema": st_json.schema_with_additional_properties_false(),
+				}),
+			);
+		}
+
+		// Insert output_config once, merging effort + format into a single object.
+		if !output_config.is_empty() {
+			payload.x_insert("output_config", Value::Object(output_config))?;
+		}
+
+		if let Some(temperature) = options_set.temperature() {
+			payload.x_insert("temperature", temperature)?;
+		}
+
+		if !options_set.stop_sequences().is_empty() {
+			payload.x_insert("stop_sequences", options_set.stop_sequences())?;
+		}
+
+		let max_tokens = Self::resolve_max_tokens(model_name, options_set);
+		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
+
+		if let Some(top_p) = options_set.top_p() {
+			payload.x_insert("top_p", top_p)?;
+		}
+
+		Ok((payload, model_name.to_string()))
+	}
+
 	/// Resolves the max_tokens value for an Anthropic model, using the user-provided
 	/// value if set, or a model-appropriate default.
 	pub(in crate::adapter) fn resolve_max_tokens(model_name: &str, options_set: &ChatOptionsSet) -> u32 {
@@ -967,6 +990,49 @@ mod tests {
 			Some("json_schema"),
 			"format.type must be present in output_config"
 		);
+	}
+
+	/// Verifies that `build_anthropic_request_payload` produces output_config with
+	/// json_schema format when a JsonSpec response format is provided, and that
+	/// the returned payload does NOT contain a `"model"` key (that's the caller's job).
+	#[test]
+	fn test_build_payload_has_output_config_and_no_model() {
+		let chat_options = ChatOptions {
+			response_format: Some(ChatResponseFormat::JsonSpec(JsonSpec::new(
+				"test_schema",
+				json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+			))),
+			..Default::default()
+		};
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+
+		let (payload, resolved_model_name) = AnthropicAdapter::build_anthropic_request_payload(
+			"claude-sonnet-4-6",
+			ServiceType::Chat,
+			ChatRequest::from_user("hello"),
+			&options_set,
+		)
+		.expect("build_anthropic_request_payload should succeed");
+
+		assert_eq!(resolved_model_name, "claude-sonnet-4-6");
+
+		// output_config.format must be present with json_schema type
+		let output_config = payload.get("output_config").expect("output_config must be present");
+		assert_eq!(
+			output_config.get("format").and_then(|f| f.get("type")).and_then(|v| v.as_str()),
+			Some("json_schema"),
+			"format.type must be json_schema"
+		);
+		assert!(
+			output_config
+				.get("format")
+				.and_then(|f| f.get("schema"))
+				.is_some(),
+			"format.schema must be present"
+		);
+
+		// "model" must NOT be in the payload -- caller inserts it
+		assert!(payload.get("model").is_none(), "model must not be in shared payload");
 	}
 
 	#[test]
